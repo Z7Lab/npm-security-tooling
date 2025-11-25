@@ -1,0 +1,9 @@
+# Internal docs (planning, specs, review history — not for public repo)
+docs/internal/
+
+# Temporary files and local-only docs
+tmp/
+
+# Generated files
+npm-audit-*.log
+fix-vulnerabilities-*.sh
