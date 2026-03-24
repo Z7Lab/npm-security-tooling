@@ -13,6 +13,7 @@ This guide explains the security configurations automatically applied by `setup-
 - [Multi-Package Manager Protection](#multi-package-manager-protection)
 - [Automated Security Scanning](#automated-security-scanning)
 - [Static Analysis (SAST) Scanning](#static-analysis-sast-scanning)
+- [TypeScript Security Scanning](#typescript-security-scanning)
 - [Scripts Reference](#scripts-reference)
 - [Daily Workflow](#daily-workflow)
 - [When Audit Fix Can't Resolve Vulnerabilities](#when-audit-fix-cant-resolve-vulnerabilities)
@@ -723,6 +724,94 @@ Clean projects: 1
 
 ---
 
+## TypeScript Security Scanning
+
+### Why TypeScript Needs Special Scanning
+
+TypeScript projects have unique attack surfaces beyond what general SAST covers:
+
+- **Compiler plugins** — `tsconfig.json` supports a `plugins` array in `compilerOptions`. Custom transformers execute arbitrary code at compile time with full system access.
+- **Build tool configs** — Vite, Webpack, Rollup, and esbuild configs can import plugins that run during the build. A malicious plugin has the same access as your build process.
+- **@types/ packages** — Type definitions from DefinitelyTyped are maintained by different people than the base package. A compromised `@types/` package can include postinstall scripts or executable code alongside the `.d.ts` files.
+- **package.json scripts** — Custom build scripts may contain obfuscated commands, network calls, or encoded payloads.
+- **npm registry metadata** — Typosquatting, recently published versions, and pulled packages are signals of supply chain compromise.
+
+### scan-ts-threats.sh
+
+Scans for TypeScript and build tooling threats across 5 stages:
+
+```bash
+# Scan a project
+./scripts/scan-ts-threats.sh ~/dev/projects/my-app
+
+# Scan all projects in a directory
+./scripts/scan-ts-threats.sh ~/dev/projects
+
+# Deep scan (checks all @types packages and all .d.ts files)
+./scripts/scan-ts-threats.sh ~/dev/projects --deep
+```
+
+**Stages:**
+
+1. **tsconfig.json compiler plugins** — Flags custom transformers in `compilerOptions.plugins`
+2. **Build tool configuration** — Scans vite/webpack/rollup/esbuild configs for `eval()`, `child_process`, network calls, and encoded strings
+3. **@types/ package audit** — Checks for postinstall scripts, native addons (`binding.gyp`), and executable `.js` files in type-only packages
+4. **package.json scripts** — Flags `curl`/`wget`, `eval`/`node -e`, encoded strings, and unexpected `npx` calls
+5. **.d.ts executable code** — Detects `require()`, runtime `import()`, `eval()`, and direct module usage hidden in type declaration files
+
+**Modes:**
+
+- **Default (fast):** Checks packages in devDependencies and samples 200 `.d.ts` files
+- **`--deep`:** Checks all `@types/` packages in `node_modules` and all `.d.ts` files
+
+The scanner is also integrated into `sast-scan.sh` — use `--ts-threats-only` to run just this stage.
+
+### check-npm-metadata.mjs
+
+Queries the npm registry to check supply chain metadata for every package in your lockfile:
+
+```bash
+# Check a project
+node ./scripts/check-npm-metadata.mjs --dir ~/dev/projects/my-app
+
+# Check a specific lockfile
+node ./scripts/check-npm-metadata.mjs --lockfile package-lock.json
+
+# JSON output (for CI)
+node ./scripts/check-npm-metadata.mjs --dir ~/dev/projects/my-app --json
+
+# Skip @types/ specific checks
+node ./scripts/check-npm-metadata.mjs --dir ~/dev/projects/my-app --skip-types
+```
+
+**Checks performed:**
+
+| Check | Severity | Description |
+|---|---|---|
+| Package not on registry | HIGH | Package in lockfile but not found on npm — may have been pulled/unpublished |
+| Typosquatting | HIGH | Name within edit distance 1 of a popular package (e.g., `expresss`, `lod-ash`) |
+| Recently published | MEDIUM | Current version published within the last 7 days |
+| @types/ lifecycle scripts | HIGH | `@types/` package has postinstall/preinstall scripts |
+| @types/ recently created | MEDIUM | `@types/` package created very recently |
+| Missing repository URL | LOW | No source repository linked on npm |
+| Few releases | LOW | Fewer than 3 versions published |
+| No maintainer info | LOW | No maintainer listed on npm |
+
+**Notes:**
+
+- Uses only Node.js built-ins (no npm dependencies required)
+- Rate-limited to avoid hammering the npm registry (50ms between requests)
+- Supports `package-lock.json` versions 2 and 3
+
+**When to run:**
+
+- After adding new dependencies
+- Periodically as part of security audits
+- Before deploying to production
+- When investigating supply chain incidents
+
+---
+
 ## Scripts Reference
 
 ### 1. setup-security.sh (RECOMMENDED - Run this first)
@@ -849,7 +938,7 @@ npx-audit allowlist remove <pkg>
 
 **Features:**
 
-- Runs ESLint security rules, Semgrep, and js-x-ray against project source code
+- Runs ESLint security rules, Semgrep, js-x-ray, and TypeScript threat scan against project source code
 - Scans single projects or all projects in a directory
 - Gracefully handles missing tools (runs whichever are available)
 - Colored output with per-project and overall summary
@@ -862,6 +951,41 @@ npx-audit allowlist remove <pkg>
 - In CI/CD pipelines
 - After writing new code that handles user input
 - Periodically as part of security audits
+
+### 6. scan-ts-threats.sh
+
+**Purpose:** TypeScript and build tooling threat detection
+
+**Features:**
+
+- 5-stage scanner: tsconfig plugins, build configs, @types audit, package.json scripts, .d.ts executable code
+- Default fast mode (samples .d.ts files) and `--deep` mode (checks everything)
+- Integrated into `sast-scan.sh` as an additional stage
+- Color-coded severity output and timestamped log files
+
+**When to run:**
+
+- After adding new TypeScript dependencies or build tool plugins
+- Before deploying TypeScript projects to production
+- Periodically as part of security audits
+
+### 7. check-npm-metadata.mjs
+
+**Purpose:** npm registry supply chain metadata checking
+
+**Features:**
+
+- Queries npm registry for every package in your lockfile
+- Detects typosquatting, pulled/unpublished packages, recent publishes
+- Special handling for `@types/` packages (lifecycle scripts, low activity)
+- No npm dependencies — uses only Node.js built-ins
+- JSON output mode for CI integration
+
+**When to run:**
+
+- After adding new dependencies
+- Periodically as part of security audits
+- When investigating supply chain incidents
 
 ---
 

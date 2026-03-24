@@ -37,7 +37,7 @@ fail() {
 
 # ── 1. Aikido Safe Chain Installation ──────────────────────────
 
-echo -e "${BLUE}[1/6] Aikido Safe Chain${NC}"
+echo -e "${BLUE}[1/7] Aikido Safe Chain${NC}"
 
 if command -v safe-chain &> /dev/null; then
     version=$(safe-chain --version 2>&1)
@@ -69,7 +69,7 @@ echo ""
 
 # ── 2. Package Manager Interception ───────────────────────────
 
-echo -e "${BLUE}[2/6] Package Manager Interception${NC}"
+echo -e "${BLUE}[2/7] Package Manager Interception${NC}"
 echo "     (Checking if commands route through Aikido wrappers)"
 echo ""
 
@@ -109,7 +109,7 @@ echo ""
 
 # ── 3. Package Manager Configs ────────────────────────────────
 
-echo -e "${BLUE}[3/6] Package Manager Configuration${NC}"
+echo -e "${BLUE}[3/7] Package Manager Configuration${NC}"
 
 # npm
 if [ -f ~/.npmrc ]; then
@@ -175,7 +175,7 @@ echo ""
 
 # ── 4. npx-audit (CVE Scanner) ────────────────────────────────
 
-echo -e "${BLUE}[4/6] npx-audit (CVE Scanner)${NC}"
+echo -e "${BLUE}[4/7] npx-audit (CVE Scanner)${NC}"
 
 npx_audit_installed=false
 
@@ -242,7 +242,7 @@ echo ""
 
 # ── 5. SAST Tools (Static Analysis) ──────────────────────────
 
-echo -e "${BLUE}[5/6] SAST Tools (Static Analysis)${NC}"
+echo -e "${BLUE}[5/7] SAST Tools (Static Analysis)${NC}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 sast_available=0
@@ -299,9 +299,38 @@ fi
 echo "     ($sast_available of 3 SAST tools available)"
 echo ""
 
-# ── 6. Coverage Gaps ──────────────────────────────────────────
+# ── 6. TypeScript Scanning ────────────────────────────────────
 
-echo -e "${BLUE}[6/6] Coverage Summary${NC}"
+echo -e "${BLUE}[6/7] TypeScript Scanning${NC}"
+
+ts_available=0
+
+if [ -f "$SCRIPT_DIR/scan-ts-threats.sh" ]; then
+    pass "scan-ts-threats.sh script present"
+    ts_available=$((ts_available + 1))
+else
+    warn "scan-ts-threats.sh not found in scripts directory"
+fi
+
+if [ -f "$SCRIPT_DIR/check-npm-metadata.mjs" ]; then
+    pass "check-npm-metadata.mjs script present"
+    ts_available=$((ts_available + 1))
+else
+    warn "check-npm-metadata.mjs not found in scripts directory"
+fi
+
+if command -v jq &> /dev/null; then
+    pass "jq available (required by TypeScript scanner)"
+else
+    warn "jq not installed (required by scan-ts-threats.sh)"
+fi
+
+echo "     ($ts_available of 2 TypeScript scanning tools available)"
+echo ""
+
+# ── 7. Coverage Gaps ──────────────────────────────────────────
+
+echo -e "${BLUE}[7/7] Coverage Summary${NC}"
 echo ""
 echo "  Aikido Safe Chain scans for MALWARE (backdoors, crypto miners, data exfiltration)."
 echo "  npx-audit scans for known CVE vulnerabilities in package dependency trees."
@@ -314,12 +343,16 @@ if [ "$npx_audit_installed" = true ]; then
     echo "    Malware             | Aikido      | Aikido      | Aikido        | N/A"
     echo "    Known CVEs          | npm audit   | npx-audit   | pnpm/yarn aud | N/A"
     echo "    Code vulnerabilities| N/A         | N/A         | N/A           | sast-scan.sh"
+    echo "    Build/TS threats    | N/A         | N/A         | N/A           | scan-ts-threats"
+    echo "    Supply chain meta   | N/A         | N/A         | N/A           | check-npm-meta"
 else
     echo "    Threat              | npm install | npx <pkg>   | pnpm/yarn/bun | Source Code"
     echo "    --------------------|-------------|-------------|---------------|-------------"
     echo "    Malware             | Aikido      | Aikido      | Aikido        | N/A"
     echo "    Known CVEs          | npm audit   | NOT COVERED | pnpm/yarn aud | N/A"
     echo "    Code vulnerabilities| N/A         | N/A         | N/A           | sast-scan.sh"
+    echo "    Build/TS threats    | N/A         | N/A         | N/A           | scan-ts-threats"
+    echo "    Supply chain meta   | N/A         | N/A         | N/A           | check-npm-meta"
     echo ""
     echo "  ⚠️  Install npx-audit to close the npx CVE gap:"
     echo "    ./scripts/setup-security.sh"
