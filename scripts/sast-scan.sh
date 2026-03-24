@@ -26,7 +26,7 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
-LOG_FILE="$SCRIPT_DIR/output/sast-scan-$TIMESTAMP.log"
+LOG_FILE="$SCRIPT_DIR/logs/sast-scan-$TIMESTAMP.log"
 
 # Parse flags
 RUN_ESLINT=true

@@ -22,8 +22,8 @@ fi
 # Get the directory where this script is located (for log/script output)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
-LOG_FILE="$SCRIPT_DIR/output/npm-audit-$TIMESTAMP.log"
-FIX_SCRIPT="$SCRIPT_DIR/output/fix-vulnerabilities-$TIMESTAMP.sh"
+LOG_FILE="$SCRIPT_DIR/logs/npm-audit-$TIMESTAMP.log"
+FIX_SCRIPT="$SCRIPT_DIR/fix-scripts/fix-vulnerabilities-$TIMESTAMP.sh"
 
 echo "==================================================================" | tee -a "$LOG_FILE"
 echo "NPM Security Audit - $(date)" | tee -a "$LOG_FILE"

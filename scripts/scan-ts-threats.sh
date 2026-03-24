@@ -36,10 +36,10 @@ fi
 # Script directory and timestamp
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
-LOG_FILE="$SCRIPT_DIR/output/ts-threats-$TIMESTAMP.log"
+LOG_FILE="$SCRIPT_DIR/logs/ts-threats-$TIMESTAMP.log"
 
-# Ensure output directory exists
-mkdir -p "$SCRIPT_DIR/output"
+# Ensure logs directory exists
+mkdir -p "$SCRIPT_DIR/logs"
 
 # Counters
 TOTAL_PROJECTS=0
