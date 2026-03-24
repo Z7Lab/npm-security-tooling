@@ -38,12 +38,14 @@ The setup script automatically:
 | Malware | Socket¹ + Aikido² | Aikido² | Aikido² | N/A |
 | Known CVEs | `npm audit`³ | `npx-audit`³ | `pnpm/yarn audit`³ | N/A |
 | Code vulnerabilities | N/A | N/A | N/A | `sast-scan.sh` |
+| Build/TS threats | N/A | N/A | N/A | `scan-ts-threats.sh` |
+| Supply chain metadata | N/A | N/A | N/A | `check-npm-metadata.mjs` |
 
 ¹ Socket Firewall (optional) — dry-run scan using Socket.dev threat intelligence before install.
 ² Aikido Safe Chain — scans using Aikido threat intelligence. Performs the actual install for npm.
 ³ GitHub Advisory Database (GHSA).
 
-When dual-scan is enabled, `npm install/ci/add` goes through both scanners (Socket dry-run first, then Aikido real install). Non-install commands route through Socket only. See `scripts/internal/npm-dual-scan.sh`.
+When dual-scan is enabled, `npm install/ci/add` goes through both scanners (Socket dry-run first, then Aikido real install). Non-install commands route through Socket only. See `scripts/npm-dual-scan.sh`.
 
 For CVE scanning of installed project dependencies, use `audit-all-projects.sh`.
 For static analysis of your source code, use `sast-scan.sh`.
@@ -54,8 +56,10 @@ For static analysis of your source code, use `sast-scan.sh`.
   - **`setup-security.sh`** – Automated setup: installs Aikido Safe Chain + npx-audit + SAST tools, runs `safe-chain setup` for shell integration, hardens all package manager configs
   - `npx-audit` – CVE vulnerability scanner for npx, pnpm dlx, yarn dlx, bunx (installed to `~/.local/bin` by setup script)
   - `audit-all-projects.sh` – Scans all projects with `npm audit`, generates timestamped logs and auto-fix scripts
-  - `sast-scan.sh` – Static analysis scanner: runs ESLint security rules, Semgrep, and js-x-ray against project source code
+  - `sast-scan.sh` – Static analysis scanner: runs ESLint security rules, Semgrep, js-x-ray, and TypeScript threat scan against project source code
   - `js-x-ray-scan.mjs` – Node.js wrapper for js-x-ray (used by `sast-scan.sh`)
+  - `scan-ts-threats.sh` – TypeScript/build tooling threat scanner (compiler plugins, @types audit, dangerous scripts, executable .d.ts)
+  - `check-npm-metadata.mjs` – npm registry supply chain metadata checker (typosquatting, recent publishes, pulled packages, @types risks)
   - `harden-projects.sh` – Adds project-level `.npmrc` (ignore-scripts, save-exact, package-lock) so projects are protected on any machine, even without Aikido/Socket installed
   - `verify-security.sh` – Verifies that Aikido, npx-audit, SAST tools, and package manager configs are all active
 - `configs/`
@@ -320,6 +324,34 @@ Scan your source code for security vulnerabilities (eval, innerHTML, SQL injecti
 - **js-x-ray** — Detects obfuscated code, encoded literals, unsafe imports
 
 All tools are optional — the scan runs whichever tools are installed and reports combined results.
+
+### 6. TypeScript Security Scanning
+
+TypeScript projects have unique attack surfaces: compiler plugins execute at build time, `@types/` packages are maintained by different people than the base package, and build tool configs (Vite, Webpack, Rollup) can import malicious plugins with full system access.
+
+```bash
+# Scan a project for TypeScript/build tooling threats
+./scripts/scan-ts-threats.sh ~/dev/projects/my-app
+
+# Deep scan (thorough, slower — checks all @types and .d.ts files)
+./scripts/scan-ts-threats.sh ~/dev/projects --deep
+
+# Check npm supply chain metadata (typosquatting, recent publishes, @types risks)
+node ./scripts/check-npm-metadata.mjs --dir ~/dev/projects/my-app
+
+# JSON output for CI integration
+node ./scripts/check-npm-metadata.mjs --lockfile package-lock.json --json
+```
+
+**What gets scanned:**
+- **tsconfig.json** — Compiler plugins and custom transformers
+- **Build configs** — Vite, Webpack, Rollup configs for dangerous patterns (eval, child_process, network calls)
+- **@types/ packages** — Postinstall scripts, executable code in type-only packages
+- **package.json scripts** — Suspicious commands (curl, wget, eval, encoded strings)
+- **.d.ts files** — Executable code hidden in type declarations
+- **npm registry metadata** — Typosquatting, recently published versions, pulled packages, missing repos
+
+Both tools are also integrated into `sast-scan.sh` — run `--ts-threats-only` to run just the TypeScript checks.
 
 ---
 

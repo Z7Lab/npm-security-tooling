@@ -547,10 +547,11 @@ echo ""
 echo "Static analysis tools detect security vulnerabilities in your source code"
 echo "(eval(), innerHTML, SQL injection patterns, obfuscated code, etc.)"
 echo ""
-echo "Three tools available:"
+echo "Four tools available:"
 echo "  1. ESLint + security plugins  — Pattern-based JS/TS vulnerability detection"
 echo "  2. Semgrep                    — Multi-language SAST with curated security rules"
 echo "  3. js-x-ray                   — Detects obfuscated code and malicious patterns"
+echo "  4. TypeScript threat scanner  — Build config, @types, and compiler plugin risks"
 echo ""
 echo "Install SAST scanning tools? (y/N)"
 read -r install_sast
@@ -611,6 +612,12 @@ if [[ "$install_sast" == "y" || "$install_sast" == "Y" ]]; then
 
     echo ""
     echo -e "${GREEN}✅ SAST tools setup complete${NC}"
+    echo ""
+    echo -e "${GREEN}TypeScript threat scanner included (no additional install needed)${NC}"
+    echo "   Run: ./scripts/scan-ts-threats.sh /path/to/project"
+    echo "   Run: node ./scripts/check-npm-metadata.mjs --dir /path/to/project"
+    echo ""
+    echo "   Or run all SAST tools together:"
     echo "   Run: ./scripts/sast-scan.sh /path/to/project"
 else
     echo -e "${BLUE}ℹ️  Skipping SAST tools${NC}"
@@ -647,6 +654,13 @@ if node -e "require('@nodesecure/js-x-ray')" 2>/dev/null; then
     echo "  🔬 SAST: js-x-ray"
 fi
 
+if [ -f "$SCRIPT_DIR/scan-ts-threats.sh" ]; then
+    echo "  🔬 SAST: TypeScript threat scanner (build configs, @types, compiler plugins)"
+fi
+if [ -f "$SCRIPT_DIR/check-npm-metadata.mjs" ]; then
+    echo "  🔬 Supply chain: npm metadata checker (typosquatting, recent publishes)"
+fi
+
 echo ""
 echo "Next steps:"
 echo "  1. Open a new terminal (or run: source ~/.bashrc)"
@@ -667,6 +681,12 @@ echo "     (or specify any directory to scan)"
 echo ""
 echo "  5. Run SAST scan on your source code:"
 echo "     ./scripts/sast-scan.sh ~/dev/projects"
+echo ""
+echo "  6. Check npm supply chain metadata:"
+echo "     node ./scripts/check-npm-metadata.mjs --dir ~/dev/projects/my-app"
+echo ""
+echo "  7. Scan for TypeScript/build tooling threats:"
+echo "     ./scripts/scan-ts-threats.sh ~/dev/projects/my-app"
 echo ""
 echo "⚠️  Important: Aikido scans for MALWARE (backdoors, data exfiltration)."
 echo "   npx-audit scans for known CVE VULNERABILITIES in package dependency trees."

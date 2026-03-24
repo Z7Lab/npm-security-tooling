@@ -9,6 +9,7 @@
 #   ./sast-scan.sh --eslint-only /path       - Run only ESLint security scan
 #   ./sast-scan.sh --semgrep-only /path      - Run only Semgrep scan
 #   ./sast-scan.sh --js-x-ray-only /path     - Run only js-x-ray scan
+#   ./sast-scan.sh --ts-threats-only /path   - Run only TypeScript threat scan
 #   ./sast-scan.sh --json /path              - JSON output to stdout
 
 set -uo pipefail
@@ -31,6 +32,7 @@ LOG_FILE="$SCRIPT_DIR/output/sast-scan-$TIMESTAMP.log"
 RUN_ESLINT=true
 RUN_SEMGREP=true
 RUN_JSXRAY=true
+RUN_TS_THREATS=true
 JSON_OUTPUT=false
 TARGET_DIR=""
 
@@ -39,21 +41,29 @@ for arg in "$@"; do
         --eslint-only)
             RUN_SEMGREP=false
             RUN_JSXRAY=false
+            RUN_TS_THREATS=false
             ;;
         --semgrep-only)
             RUN_ESLINT=false
             RUN_JSXRAY=false
+            RUN_TS_THREATS=false
             ;;
         --js-x-ray-only)
             RUN_ESLINT=false
             RUN_SEMGREP=false
+            RUN_TS_THREATS=false
+            ;;
+        --ts-threats-only)
+            RUN_ESLINT=false
+            RUN_SEMGREP=false
+            RUN_JSXRAY=false
             ;;
         --json)
             JSON_OUTPUT=true
             ;;
         -*)
             echo "Unknown flag: $arg"
-            echo "Usage: ./sast-scan.sh [--eslint-only|--semgrep-only|--js-x-ray-only] [--json] [directory]"
+            echo "Usage: ./sast-scan.sh [--eslint-only|--semgrep-only|--js-x-ray-only|--ts-threats-only] [--json] [directory]"
             exit 2
             ;;
         *)
@@ -108,8 +118,13 @@ if [ "$RUN_JSXRAY" = true ] && node -e "require('@nodesecure/js-x-ray')" 2>/dev/
     HAS_JSXRAY=true
 fi
 
+HAS_TS_THREATS=false
+if [ "$RUN_TS_THREATS" = true ] && [ -f "$SCRIPT_DIR/scan-ts-threats.sh" ]; then
+    HAS_TS_THREATS=true
+fi
+
 # Check at least one tool is available
-if [ "$HAS_ESLINT" = false ] && [ "$HAS_SEMGREP" = false ] && [ "$HAS_JSXRAY" = false ]; then
+if [ "$HAS_ESLINT" = false ] && [ "$HAS_SEMGREP" = false ] && [ "$HAS_JSXRAY" = false ] && [ "$HAS_TS_THREATS" = false ]; then
     echo "Error: No SAST tools are installed."
     echo ""
     echo "Install with ./scripts/setup-security.sh or manually:"
@@ -151,6 +166,7 @@ tools_list=""
 [ "$HAS_ESLINT" = true ] && tools_list+="ESLint "
 [ "$HAS_SEMGREP" = true ] && tools_list+="Semgrep "
 [ "$HAS_JSXRAY" = true ] && tools_list+="js-x-ray "
+[ "$HAS_TS_THREATS" = true ] && tools_list+="ts-threats "
 log "Tools: $tools_list"
 [ "$HAS_ESLINT" = false ] && [ "$RUN_ESLINT" = true ] && log "${YELLOW}  ⚠️  ESLint not available (install: npm install -g eslint eslint-plugin-security eslint-plugin-no-unsanitized)${NC}"
 [ "$HAS_SEMGREP" = false ] && [ "$RUN_SEMGREP" = true ] && log "${YELLOW}  ⚠️  Semgrep not available (install: pip3 install semgrep)${NC}"
@@ -167,6 +183,7 @@ clean_projects=0
 eslint_total=0; eslint_error=0; eslint_warning=0
 semgrep_total=0; semgrep_error=0; semgrep_warning=0; semgrep_info=0
 jsxray_total=0; jsxray_critical=0; jsxray_warning=0; jsxray_info=0
+ts_total=0; ts_high=0; ts_medium=0; ts_low=0
 
 # JSON accumulator
 json_results="[]"
@@ -309,8 +326,35 @@ for project_dir in "${projects[@]}"; do
         fi
     fi
 
+    # ── TypeScript Threats Scan ──
+
+    project_ts=0
+    project_ts_high=0
+
+    if [ "$HAS_TS_THREATS" = true ]; then
+        log "   ${BLUE}Running TypeScript threat scan...${NC}"
+
+        ts_output=$("$SCRIPT_DIR/scan-ts-threats.sh" "$project_dir" 2>/dev/null || true)
+        # Count findings from output (lines starting with [HIGH], [MEDIUM], [LOW])
+        project_ts_high=$(echo "$ts_output" | grep -c '^\[HIGH\]' 2>/dev/null || echo 0)
+        project_ts_med=$(echo "$ts_output" | grep -c '^\[MEDIUM\]' 2>/dev/null || echo 0)
+        project_ts_low=$(echo "$ts_output" | grep -c '^\[LOW\]' 2>/dev/null || echo 0)
+        project_ts=$((project_ts_high + project_ts_med + project_ts_low))
+
+        ts_total=$((ts_total + project_ts))
+        ts_high=$((ts_high + project_ts_high))
+        ts_medium=$((ts_medium + project_ts_med))
+        ts_low=$((ts_low + project_ts_low))
+
+        if [ "$project_ts" -gt 0 ]; then
+            log "   ts-threats: ${YELLOW}$project_ts findings${NC} ($project_ts_high high, $project_ts_med medium, $project_ts_low low)"
+        else
+            log "   ts-threats: ${GREEN}clean${NC}"
+        fi
+    fi
+
     # Track project-level results
-    project_total=$((project_eslint + project_semgrep + project_jsxray))
+    project_total=$((project_eslint + project_semgrep + project_jsxray + project_ts))
     if [ "$project_total" -gt 0 ]; then
         projects_with_findings=$((projects_with_findings + 1))
     else
@@ -334,7 +378,7 @@ done
 
 # ── Overall Summary ───────────────────────────────────────────
 
-grand_total=$((eslint_total + semgrep_total + jsxray_total))
+grand_total=$((eslint_total + semgrep_total + jsxray_total + ts_total))
 
 if [ "$JSON_OUTPUT" = true ]; then
     jq -n \
@@ -345,12 +389,13 @@ if [ "$JSON_OUTPUT" = true ]; then
         --argjson eslintTotal "$eslint_total" \
         --argjson semgrepTotal "$semgrep_total" \
         --argjson jsxrayTotal "$jsxray_total" \
+        --argjson tsThreatsTotal "$ts_total" \
         --argjson grandTotal "$grand_total" \
         '{
             totalProjects: $totalProjects,
             projectsWithFindings: $projectsWithFindings,
             cleanProjects: $cleanProjects,
-            findings: {eslint: $eslintTotal, semgrep: $semgrepTotal, jsxray: $jsxrayTotal, total: $grandTotal},
+            findings: {eslint: $eslintTotal, semgrep: $semgrepTotal, jsxray: $jsxrayTotal, tsThreats: $tsThreatsTotal, total: $grandTotal},
             projects: $projects
         }'
 else
@@ -371,6 +416,8 @@ else
         log "  Semgrep       | $(printf '%5d' $semgrep_total) | $(printf '%14d' $semgrep_error) | $(printf '%7d' $semgrep_warning) | $(printf '%4d' $semgrep_info)"
         [ "$HAS_JSXRAY" = true ] && \
         log "  js-x-ray      | $(printf '%5d' $jsxray_total) | $(printf '%14d' $jsxray_critical) | $(printf '%7d' $jsxray_warning) | $(printf '%4d' $jsxray_info)"
+        [ "$HAS_TS_THREATS" = true ] && \
+        log "  ts-threats    | $(printf '%5d' $ts_total) | $(printf '%14d' $ts_high) | $(printf '%7d' $ts_medium) | $(printf '%4d' $ts_low)"
         log "  --------------|-------|----------------|---------|-----"
         log "  TOTAL         | $(printf '%5d' $grand_total) |                |         |"
         log ""
