@@ -1,0 +1,989 @@
+#!/bin/bash
+# npx-audit — CVE vulnerability scanner for npx, pnpm dlx, yarn dlx, bunx
+#
+# Scans packages for known CVE vulnerabilities before execution.
+# Uses deps.dev API (primary) with npm audit fallback.
+#
+# Usage:
+#   npx-audit exec --runner=<npx|pnpm-dlx|yarn-dlx|bunx> <pkg> [args...]
+#   npx-audit check <pkg[@version]>
+#   npx-audit scan <pkg[@version]>
+#   npx-audit allowlist [list|remove <pkg>]
+#   npx-audit --version
+#   npx-audit --help
+
+set -uo pipefail
+
+NPX_AUDIT_VERSION="1.0.0"
+
+# ── Colors ──────────────────────────────────────────────────
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# ── Config paths ───────────────────────────────────────────
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/npx-audit"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+ALLOWLIST_FILE="$CONFIG_DIR/allowlist.json"
+
+# ── API ────────────────────────────────────────────────────
+DEPS_DEV_API="${NPX_AUDIT_API_URL:-https://api.deps.dev/v3alpha}"
+NPM_REGISTRY="https://registry.npmjs.org"
+
+# ── Defaults ───────────────────────────────────────────────
+DEFAULT_EXPIRY_DAYS=30
+API_TIMEOUT=5
+PARALLEL_JOBS=10
+
+# ── Global state ───────────────────────────────────────────
+PKG_NAME=""
+PKG_VERSION=""
+PKG_FULL=""
+ORIGINAL_ARGS=()
+VULN_COUNT=0
+VULN_CRITICAL=0
+VULN_HIGH=0
+VULN_MODERATE=0
+VULN_LOW=0
+
+# Vulnerability data stored as lines: "pkg@ver|GHSA-id|cvss|title|cve_aliases"
+VULN_DATA=""
+
+# ── Utility functions ──────────────────────────────────────
+
+log_info()  { echo -e "  ${BLUE}$1${NC}" >&2; }
+log_pass()  { echo -e "  ${GREEN}✅${NC} $1" >&2; }
+log_warn()  { echo -e "  ${YELLOW}⚠️${NC}  $1" >&2; }
+log_fail()  { echo -e "  ${RED}❌${NC} $1" >&2; }
+log_scan()  { echo -e "  ${BLUE}🔍${NC} $1" >&2; }
+
+die() { echo -e "${RED}npx-audit: $1${NC}" >&2; exit 1; }
+
+require_cmd() {
+    command -v "$1" > /dev/null 2>&1 || die "$1 is required but not found. Install it and try again."
+}
+
+urlencode_pkg() {
+    local encoded="$1"
+    encoded="${encoded//@/%40}"
+    encoded="${encoded//\//%2F}"
+    echo "$encoded"
+}
+
+# ── Configuration ──────────────────────────────────────────
+
+ensure_config_dir() {
+    mkdir -p "$CONFIG_DIR"
+}
+
+ensure_config() {
+    ensure_config_dir
+    if [ ! -f "$CONFIG_FILE" ]; then
+        cat > "$CONFIG_FILE" << 'EOF'
+{
+  "scan_strategy": "auto",
+  "allowlist_expiry_days": 30,
+  "auto_approve_clean": true,
+  "block_severity": "none",
+  "prompt_severity": "moderate",
+  "pass_severity": "low",
+  "offline_policy": "warn"
+}
+EOF
+    fi
+}
+
+ensure_allowlist() {
+    ensure_config_dir
+    if [ ! -f "$ALLOWLIST_FILE" ]; then
+        echo '{"version": 1, "packages": {}}' > "$ALLOWLIST_FILE"
+    fi
+}
+
+read_config() {
+    local key="$1" default="${2:-}"
+    if [ -f "$CONFIG_FILE" ]; then
+        local val
+        val=$(jq -r ".$key // empty" "$CONFIG_FILE" 2>/dev/null)
+        if [ -n "$val" ]; then
+            echo "$val"
+            return
+        fi
+    fi
+    echo "$default"
+}
+
+# ── Package name parsing ──────────────────────────────────
+
+parse_package_spec() {
+    local spec="$1"
+
+    if [[ "$spec" == @*/*@* ]]; then
+        # Scoped with version: @scope/pkg@1.2.3
+        # Find the last @ that's not the scope @
+        PKG_NAME="${spec%@*}"
+        # But we need to handle @scope/pkg@ver correctly
+        # Remove everything after last @
+        local after_scope="${spec#*/}"
+        if [[ "$after_scope" == *@* ]]; then
+            PKG_VERSION="${after_scope##*@}"
+            PKG_NAME="${spec%@$PKG_VERSION}"
+        else
+            PKG_NAME="$spec"
+            PKG_VERSION=""
+        fi
+    elif [[ "$spec" == @*/* ]]; then
+        # Scoped without version: @scope/pkg
+        PKG_NAME="$spec"
+        PKG_VERSION=""
+    elif [[ "$spec" == *@* ]]; then
+        # Unscoped with version: pkg@1.2.3
+        PKG_VERSION="${spec##*@}"
+        PKG_NAME="${spec%@*}"
+    else
+        # Unscoped without version: pkg
+        PKG_NAME="$spec"
+        PKG_VERSION=""
+    fi
+}
+
+parse_package_args() {
+    # Parse npx-style arguments to extract package spec
+    # Sets PKG_NAME, PKG_VERSION, PKG_FULL, and ORIGINAL_ARGS
+    local args=("$@")
+    local pkg_spec=""
+    local i=0
+
+    while [ $i -lt ${#args[@]} ]; do
+        local arg="${args[$i]}"
+        case "$arg" in
+            -y|--yes)
+                # Skip flag
+                ;;
+            -p|--package)
+                # Next arg is the package spec
+                ((i++))
+                if [ $i -lt ${#args[@]} ]; then
+                    pkg_spec="${args[$i]}"
+                fi
+                ;;
+            --package=*)
+                pkg_spec="${arg#--package=}"
+                ;;
+            --)
+                # End of flags
+                break
+                ;;
+            -*)
+                # Unknown flag, skip
+                ;;
+            *)
+                # First non-flag arg is the package spec
+                if [ -z "$pkg_spec" ]; then
+                    pkg_spec="$arg"
+                fi
+                break
+                ;;
+        esac
+        ((i++))
+    done
+
+    if [ -z "$pkg_spec" ]; then
+        die "Could not determine package name from arguments: $*"
+    fi
+
+    parse_package_spec "$pkg_spec"
+}
+
+resolve_latest_version() {
+    if [ -n "$PKG_VERSION" ]; then
+        return 0
+    fi
+
+    local encoded
+    encoded=$(urlencode_pkg "$PKG_NAME")
+    local response
+    response=$(curl -s --max-time "$API_TIMEOUT" "$NPM_REGISTRY/$encoded/latest" 2>/dev/null)
+    PKG_VERSION=$(echo "$response" | jq -r '.version // empty' 2>/dev/null)
+
+    if [ -z "$PKG_VERSION" ]; then
+        # Try alternate endpoint
+        response=$(curl -s --max-time "$API_TIMEOUT" "$NPM_REGISTRY/$encoded" 2>/dev/null)
+        PKG_VERSION=$(echo "$response" | jq -r '."dist-tags".latest // empty' 2>/dev/null)
+    fi
+
+    if [ -z "$PKG_VERSION" ]; then
+        die "Could not resolve latest version for $PKG_NAME"
+    fi
+
+    log_warn "No version pinned. Resolving latest: ${PKG_NAME}@${PKG_VERSION}"
+}
+
+# ── Allowlist ─────────────────────────────────────────────
+
+allowlist_check() {
+    ensure_allowlist
+    local pkg="$1"
+
+    local entry
+    entry=$(jq -r ".packages[\"$pkg\"] // empty" "$ALLOWLIST_FILE" 2>/dev/null)
+    if [ -z "$entry" ]; then
+        return 1
+    fi
+
+    local rescan_after
+    rescan_after=$(echo "$entry" | jq -r '.rescan_after // empty')
+    if [ -z "$rescan_after" ]; then
+        return 1
+    fi
+
+    # Check expiry
+    local now_epoch rescan_epoch
+    now_epoch=$(date +%s)
+    rescan_epoch=$(date -d "$rescan_after" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$rescan_after" +%s 2>/dev/null || echo 0)
+
+    if [ "$now_epoch" -gt "$rescan_epoch" ]; then
+        log_warn "$pkg — allowlist entry expired, rescanning"
+        return 1
+    fi
+
+    local vuln_count approved_at
+    vuln_count=$(echo "$entry" | jq -r '.vulnerabilities_at_approval // 0')
+    approved_at=$(echo "$entry" | jq -r '.approved_at // "unknown"')
+    local approved_date="${approved_at%%T*}"
+
+    if [ "$vuln_count" -gt 0 ]; then
+        echo -e "${GREEN}✅${NC} npx-audit: ${BOLD}$pkg${NC} — approved (allowlisted $approved_date)" >&2
+        echo -e "   ${YELLOW}⚠️  $vuln_count known CVEs acknowledged${NC} — see $ALLOWLIST_FILE" >&2
+    else
+        echo -e "${GREEN}✅${NC} npx-audit: ${BOLD}$pkg${NC} — no known vulnerabilities (allowlisted $approved_date)" >&2
+    fi
+    return 0
+}
+
+allowlist_add() {
+    local pkg="$1" approved_by="$2" vuln_count="$3" reason="${4:-}"
+    ensure_allowlist
+
+    local now expiry_days rescan
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    expiry_days=$(read_config "allowlist_expiry_days" "$DEFAULT_EXPIRY_DAYS")
+    rescan=$(date -u -d "+${expiry_days} days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+        || date -u -v "+${expiry_days}d" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+        || date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    local tmp
+    tmp=$(mktemp)
+    jq --arg pkg "$pkg" \
+       --arg at "$now" \
+       --arg by "$approved_by" \
+       --argjson vc "$vuln_count" \
+       --arg reason "$reason" \
+       --arg rescan "$rescan" \
+       '.packages[$pkg] = {
+           approved_at: $at,
+           approved_by: $by,
+           vulnerabilities_at_approval: $vc,
+           reason: $reason,
+           rescan_after: $rescan
+       }' "$ALLOWLIST_FILE" > "$tmp" && mv "$tmp" "$ALLOWLIST_FILE"
+}
+
+allowlist_remove() {
+    local pkg="$1"
+    ensure_allowlist
+    local tmp
+    tmp=$(mktemp)
+    jq --arg pkg "$pkg" 'del(.packages[$pkg])' "$ALLOWLIST_FILE" > "$tmp" && mv "$tmp" "$ALLOWLIST_FILE"
+    echo "Removed $pkg from allowlist"
+}
+
+allowlist_list() {
+    ensure_allowlist
+    local count
+    count=$(jq '.packages | length' "$ALLOWLIST_FILE" 2>/dev/null || echo 0)
+
+    if [ "$count" -eq 0 ]; then
+        echo "Allowlist is empty."
+        return
+    fi
+
+    local now_epoch
+    now_epoch=$(date +%s)
+
+    echo ""
+    printf "  %-45s %-12s %-6s %s\n" "Package" "Approved" "CVEs" "Status"
+    printf "  %-45s %-12s %-6s %s\n" "-------" "--------" "----" "------"
+
+    jq -r '.packages | to_entries[] | "\(.key)|\(.value.approved_at)|\(.value.vulnerabilities_at_approval)|\(.value.rescan_after)"' \
+        "$ALLOWLIST_FILE" 2>/dev/null | while IFS='|' read -r pkg approved vulns rescan; do
+        local approved_date="${approved%%T*}"
+        local rescan_epoch
+        rescan_epoch=$(date -d "$rescan" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$rescan" +%s 2>/dev/null || echo 0)
+
+        local status
+        if [ "$now_epoch" -gt "$rescan_epoch" ]; then
+            status="${RED}expired${NC}"
+        else
+            status="${GREEN}active${NC}"
+        fi
+
+        printf "  %-45s %-12s %-6s " "$pkg" "$approved_date" "$vulns"
+        echo -e "$status"
+    done
+    echo ""
+}
+
+# ── Scanning: deps.dev API ────────────────────────────────
+
+classify_severity() {
+    local score="$1"
+    # Use awk for float comparison
+    echo "$score" | awk '{
+        if ($1 >= 9.0) print "CRITICAL"
+        else if ($1 >= 7.0) print "HIGH"
+        else if ($1 >= 4.0) print "MODERATE"
+        else print "LOW"
+    }'
+}
+
+scan_deps_dev() {
+    local pkg_name="$1" pkg_version="$2"
+    local encoded
+    encoded=$(urlencode_pkg "$pkg_name")
+
+    # Step 1: Fetch dependency tree
+    log_scan "Fetching dependency tree..."
+    local deps_response
+    deps_response=$(curl -s --max-time "$API_TIMEOUT" \
+        "$DEPS_DEV_API/systems/npm/packages/${encoded}/versions/${pkg_version}:dependencies" 2>/dev/null)
+
+    if [ -z "$deps_response" ]; then
+        return 1
+    fi
+
+    # Check if response has a non-empty error field
+    local api_error
+    api_error=$(echo "$deps_response" | jq -r '.error // empty' 2>/dev/null)
+    if [ -n "$api_error" ]; then
+        return 1
+    fi
+
+    # Extract all unique name@version pairs
+    local dep_list
+    dep_list=$(echo "$deps_response" | jq -r '.nodes[]? | "\(.versionKey.name)@\(.versionKey.version)"' 2>/dev/null)
+
+    if [ -z "$dep_list" ]; then
+        return 1
+    fi
+
+    local dep_count
+    dep_count=$(echo "$dep_list" | wc -l)
+    log_scan "Scanning $dep_count packages for advisories..."
+
+    # Step 2: Check each dependency for advisories (parallel)
+    local results_dir
+    results_dir=$(mktemp -d)
+    trap "rm -rf '$results_dir'" RETURN
+
+    echo "$dep_list" | xargs -P "$PARALLEL_JOBS" -I {} bash -c '
+        spec="$1"
+        api_url="$2"
+        timeout="$3"
+        results_dir="$4"
+
+        # Parse name@version
+        if [[ "$spec" == @*/*@* ]]; then
+            pkg_name="${spec%@*}"
+            # Handle scoped: find last @ after /
+            after_slash="${spec#*/}"
+            if [[ "$after_slash" == *@* ]]; then
+                pkg_ver="${after_slash##*@}"
+                pkg_name="${spec%@$pkg_ver}"
+            else
+                exit 0
+            fi
+        elif [[ "$spec" == *@* ]]; then
+            pkg_ver="${spec##*@}"
+            pkg_name="${spec%@*}"
+        else
+            exit 0
+        fi
+
+        encoded="${pkg_name//@/%40}"
+        encoded="${encoded//\//%2F}"
+
+        response=$(curl -s --max-time "$timeout" \
+            "$api_url/systems/npm/packages/${encoded}/versions/${pkg_ver}" 2>/dev/null)
+
+        advisories=$(echo "$response" | jq -r ".advisoryKeys[]?.id // empty" 2>/dev/null)
+        if [ -n "$advisories" ]; then
+            echo "$advisories" | while read -r advisory_id; do
+                echo "${spec}|${advisory_id}" >> "$results_dir/advisories.txt"
+            done
+        fi
+    ' _ {} "$DEPS_DEV_API" "$API_TIMEOUT" "$results_dir"
+
+    if [ ! -f "$results_dir/advisories.txt" ]; then
+        # No advisories found — clean
+        VULN_COUNT=0
+        VULN_DATA=""
+        return 0
+    fi
+
+    # Step 3: Fetch advisory details for each unique GHSA ID
+    local advisory_ids
+    advisory_ids=$(cut -d'|' -f2 "$results_dir/advisories.txt" | sort -u)
+
+    log_scan "Fetching details for $(echo "$advisory_ids" | wc -l) advisories..."
+
+    echo "$advisory_ids" | xargs -P "$PARALLEL_JOBS" -I {} bash -c '
+        advisory_id="$1"
+        api_url="$2"
+        timeout="$3"
+        results_dir="$4"
+
+        response=$(curl -s --max-time "$timeout" "$api_url/advisories/$advisory_id" 2>/dev/null)
+
+        title=$(echo "$response" | jq -r ".title // \"Unknown\"" 2>/dev/null)
+        score=$(echo "$response" | jq -r ".cvss3Score // 0" 2>/dev/null)
+        aliases=$(echo "$response" | jq -r "[.aliases[]? // empty] | join(\",\")" 2>/dev/null)
+
+        echo "${advisory_id}|${score}|${title}|${aliases}" >> "$results_dir/details.txt"
+    ' _ {} "$DEPS_DEV_API" "$API_TIMEOUT" "$results_dir"
+
+    # Step 4: Merge advisory data with package info
+    VULN_DATA=""
+    VULN_COUNT=0
+    VULN_CRITICAL=0
+    VULN_HIGH=0
+    VULN_MODERATE=0
+    VULN_LOW=0
+
+    while IFS='|' read -r pkg advisory_id; do
+        local detail_line=""
+        if [ -f "$results_dir/details.txt" ]; then
+            detail_line=$(grep "^${advisory_id}|" "$results_dir/details.txt" 2>/dev/null | head -1)
+        fi
+
+        local score="0" title="Unknown" aliases=""
+        if [ -n "$detail_line" ]; then
+            score=$(echo "$detail_line" | cut -d'|' -f2)
+            title=$(echo "$detail_line" | cut -d'|' -f3)
+            aliases=$(echo "$detail_line" | cut -d'|' -f4)
+        fi
+
+        local severity
+        severity=$(classify_severity "$score")
+
+        VULN_DATA="${VULN_DATA}${pkg}|${advisory_id}|${score}|${severity}|${title}|${aliases}
+"
+        ((VULN_COUNT++))
+
+        case "$severity" in
+            CRITICAL) ((VULN_CRITICAL++)) ;;
+            HIGH)     ((VULN_HIGH++)) ;;
+            MODERATE) ((VULN_MODERATE++)) ;;
+            LOW)      ((VULN_LOW++)) ;;
+        esac
+    done < "$results_dir/advisories.txt"
+
+    return 0
+}
+
+# ── Scanning: npm audit fallback ──────────────────────────
+
+scan_npm_audit() {
+    local pkg_name="$1" pkg_version="$2"
+
+    log_scan "API unavailable, falling back to npm audit..."
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+
+    cat > "$tmp_dir/package.json" << EOF
+{
+  "name": "npx-audit-scan",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "$pkg_name": "$pkg_version"
+  }
+}
+EOF
+
+    # Generate lockfile without downloading tarballs
+    (cd "$tmp_dir" && npm install --ignore-scripts --package-lock-only 2>/dev/null) || {
+        rm -rf "$tmp_dir"
+        return 1
+    }
+
+    # Run audit
+    local audit_json
+    audit_json=$(cd "$tmp_dir" && npm audit --json 2>/dev/null) || true
+
+    rm -rf "$tmp_dir"
+
+    if [ -z "$audit_json" ]; then
+        return 1
+    fi
+
+    # Parse npm audit JSON output
+    VULN_DATA=""
+    VULN_COUNT=0
+    VULN_CRITICAL=0
+    VULN_HIGH=0
+    VULN_MODERATE=0
+    VULN_LOW=0
+
+    local vulns
+    vulns=$(echo "$audit_json" | jq -r '
+        .vulnerabilities // {} | to_entries[] |
+        "\(.key)@\(.value.range // "?")|\(.value.severity)|\(.value.via[0].title // .value.via[0] // "Unknown")|\(.value.via[0].url // "")"
+    ' 2>/dev/null)
+
+    if [ -z "$vulns" ]; then
+        return 0
+    fi
+
+    while IFS='|' read -r pkg severity title url; do
+        [ -z "$pkg" ] && continue
+
+        local score="0"
+        case "$severity" in
+            critical) score="9.5"; severity="CRITICAL"; ((VULN_CRITICAL++)) ;;
+            high)     score="8.0"; severity="HIGH"; ((VULN_HIGH++)) ;;
+            moderate) score="5.0"; severity="MODERATE"; ((VULN_MODERATE++)) ;;
+            low)      score="2.0"; severity="LOW"; ((VULN_LOW++)) ;;
+            *)        score="0"; severity="LOW"; ((VULN_LOW++)) ;;
+        esac
+
+        local advisory_id=""
+        if [[ "$url" == *github.com/advisories/* ]]; then
+            advisory_id="${url##*/}"
+        fi
+
+        VULN_DATA="${VULN_DATA}${pkg}|${advisory_id}|${score}|${severity}|${title}|
+"
+        ((VULN_COUNT++))
+    done <<< "$vulns"
+
+    return 0
+}
+
+# ── Scan orchestrator ─────────────────────────────────────
+
+scan_package() {
+    local strategy
+    strategy=$(read_config "scan_strategy" "auto")
+
+    local scan_ok=false
+
+    if [ "$strategy" = "auto" ] || [ "$strategy" = "api-only" ]; then
+        if scan_deps_dev "$PKG_NAME" "$PKG_VERSION"; then
+            scan_ok=true
+        fi
+    fi
+
+    if [ "$scan_ok" = false ]; then
+        if [ "$strategy" = "api-only" ]; then
+            local policy
+            policy=$(read_config "offline_policy" "warn")
+            case "$policy" in
+                block) die "deps.dev API unavailable and offline_policy=block" ;;
+                pass)  VULN_COUNT=0; VULN_DATA=""; return 0 ;;
+                warn)  log_warn "deps.dev API unavailable — proceeding without CVE scan"; VULN_COUNT=0; VULN_DATA=""; return 0 ;;
+            esac
+        fi
+
+        if [ "$strategy" = "auto" ] || [ "$strategy" = "install-only" ]; then
+            if scan_npm_audit "$PKG_NAME" "$PKG_VERSION"; then
+                scan_ok=true
+            fi
+        fi
+    fi
+
+    if [ "$scan_ok" = false ]; then
+        local policy
+        policy=$(read_config "offline_policy" "warn")
+        case "$policy" in
+            block) die "All scanning methods failed and offline_policy=block" ;;
+            pass)  VULN_COUNT=0; VULN_DATA=""; return 0 ;;
+            *)     log_warn "All scanning methods failed — proceeding without CVE scan"; VULN_COUNT=0; VULN_DATA=""; return 0 ;;
+        esac
+    fi
+
+    return 0
+}
+
+# ── Report formatting ─────────────────────────────────────
+
+format_vuln_report() {
+    if [ "$VULN_COUNT" -eq 0 ]; then
+        return
+    fi
+
+    echo "" >&2
+    echo -e "  ${YELLOW}⚠️  $VULN_COUNT known vulnerabilities found in dependency tree:${NC}" >&2
+    echo "" >&2
+
+    for severity_level in CRITICAL HIGH MODERATE LOW; do
+        local count=0
+        case "$severity_level" in
+            CRITICAL) count=$VULN_CRITICAL ;;
+            HIGH)     count=$VULN_HIGH ;;
+            MODERATE) count=$VULN_MODERATE ;;
+            LOW)      count=$VULN_LOW ;;
+        esac
+
+        [ "$count" -eq 0 ] && continue
+
+        local color
+        case "$severity_level" in
+            CRITICAL) color="$RED" ;;
+            HIGH)     color="$RED" ;;
+            MODERATE) color="$YELLOW" ;;
+            LOW)      color="$DIM" ;;
+        esac
+
+        echo -e "   ${color}${BOLD}${severity_level} ($count):${NC}" >&2
+
+        local idx=0
+        echo "$VULN_DATA" | while IFS='|' read -r pkg advisory score sev title aliases; do
+            [ -z "$pkg" ] && continue
+            [ "$sev" != "$severity_level" ] && continue
+            ((idx++))
+
+            local cve_display=""
+            if [ -n "$aliases" ]; then
+                # Show first CVE alias
+                local first_cve
+                first_cve=$(echo "$aliases" | tr ',' '\n' | grep '^CVE-' | head -1)
+                if [ -n "$first_cve" ]; then
+                    cve_display="$first_cve — "
+                fi
+            fi
+
+            # Use tree drawing chars
+            local prefix="├──"
+            echo -e "   ${prefix} ${color}${pkg}${NC} — ${cve_display}${title}" >&2
+        done
+        echo "" >&2
+    done
+}
+
+# ── Interactive prompt ────────────────────────────────────
+
+prompt_user() {
+    # Non-interactive check
+    if [ ! -t 0 ] || [ ! -t 2 ]; then
+        # Non-interactive: apply severity policy
+        if [ "$VULN_CRITICAL" -gt 0 ]; then
+            log_fail "Critical vulnerabilities found (non-interactive mode — blocking)"
+            return 1
+        fi
+        log_warn "Vulnerabilities found (non-interactive mode — allowing)"
+        return 0
+    fi
+
+    echo -e "   ${BOLD}[a]${NC} Allow once — run this time only" >&2
+    echo -e "   ${BOLD}[b]${NC} Block — abort, do not run" >&2
+    echo -e "   ${BOLD}[v]${NC} View details — show advisory URLs" >&2
+    echo -e "   ${BOLD}[s]${NC} Save to allowlist — approve this package@version" >&2
+    echo "" >&2
+
+    while true; do
+        echo -n "   Choice: " >&2
+        read -r choice < /dev/tty
+
+        case "$choice" in
+            a|A)
+                return 0
+                ;;
+            b|B)
+                echo "" >&2
+                log_fail "Blocked by user"
+                return 1
+                ;;
+            v|V)
+                echo "" >&2
+                echo "$VULN_DATA" | while IFS='|' read -r pkg advisory score sev title aliases; do
+                    [ -z "$pkg" ] && continue
+                    echo -e "   ${BOLD}$pkg${NC} — $title" >&2
+                    if [ -n "$advisory" ]; then
+                        echo -e "     ${DIM}https://osv.dev/vulnerability/$advisory${NC}" >&2
+                    fi
+                    if [ -n "$aliases" ]; then
+                        echo -e "     ${DIM}Aliases: $aliases${NC}" >&2
+                    fi
+                done
+                echo "" >&2
+                ;;
+            s|S)
+                echo -n "   Reason (optional): " >&2
+                read -r reason < /dev/tty
+                allowlist_add "$PKG_FULL" "manual" "$VULN_COUNT" "${reason:-Approved by user}"
+                log_pass "Saved to allowlist: $PKG_FULL"
+                return 0
+                ;;
+            *)
+                echo "   Invalid choice. Enter a, b, v, or s." >&2
+                ;;
+        esac
+    done
+}
+
+# ── Execution delegation ──────────────────────────────────
+
+execute_runner() {
+    local runner="$1"
+    shift
+
+    case "$runner" in
+        npx)
+            if command -v aikido-npx > /dev/null 2>&1; then
+                exec aikido-npx "$@"
+            else
+                exec npx "$@"
+            fi
+            ;;
+        pnpm-dlx)
+            if command -v aikido-pnpm > /dev/null 2>&1; then
+                exec aikido-pnpm dlx "$@"
+            else
+                exec pnpm dlx "$@"
+            fi
+            ;;
+        yarn-dlx)
+            if command -v aikido-yarn > /dev/null 2>&1; then
+                exec aikido-yarn dlx "$@"
+            else
+                exec yarn dlx "$@"
+            fi
+            ;;
+        bunx)
+            if command -v aikido-bunx > /dev/null 2>&1; then
+                exec aikido-bunx "$@"
+            elif command -v aikido-bun > /dev/null 2>&1; then
+                exec aikido-bun x "$@"
+            else
+                exec bunx "$@"
+            fi
+            ;;
+        *)
+            die "Unknown runner: $runner"
+            ;;
+    esac
+}
+
+# ── Subcommands ───────────────────────────────────────────
+
+cmd_exec() {
+    local runner=""
+    local args=()
+
+    # Parse --runner flag
+    for arg in "$@"; do
+        if [[ "$arg" == --runner=* ]]; then
+            runner="${arg#--runner=}"
+        else
+            args+=("$arg")
+        fi
+    done
+
+    if [ -z "$runner" ]; then
+        die "exec requires --runner=<npx|pnpm-dlx|yarn-dlx|bunx>"
+    fi
+
+    ORIGINAL_ARGS=("${args[@]}")
+    parse_package_args "${args[@]}"
+    resolve_latest_version
+    PKG_FULL="${PKG_NAME}@${PKG_VERSION}"
+
+    ensure_config
+    ensure_allowlist
+
+    # Check allowlist
+    if allowlist_check "$PKG_FULL"; then
+        execute_runner "$runner" "${ORIGINAL_ARGS[@]}"
+        exit 0
+    fi
+
+    # Scan
+    echo -e "${BLUE}🔍${NC} npx-audit: Scanning ${BOLD}${PKG_FULL}${NC}..." >&2
+
+    scan_package
+
+    if [ "$VULN_COUNT" -eq 0 ]; then
+        echo -e "${GREEN}✅${NC} npx-audit: ${BOLD}${PKG_FULL}${NC} — no known vulnerabilities" >&2
+
+        local auto_approve
+        auto_approve=$(read_config "auto_approve_clean" "true")
+        if [ "$auto_approve" = "true" ]; then
+            allowlist_add "$PKG_FULL" "auto-clean" 0 "No vulnerabilities at scan time"
+        fi
+
+        execute_runner "$runner" "${ORIGINAL_ARGS[@]}"
+        exit 0
+    fi
+
+    # Vulnerabilities found
+    format_vuln_report
+
+    if prompt_user; then
+        execute_runner "$runner" "${ORIGINAL_ARGS[@]}"
+        exit 0
+    else
+        exit 1
+    fi
+}
+
+cmd_check() {
+    if [ $# -eq 0 ]; then
+        die "check requires a package name. Usage: npx-audit check <pkg[@version]>"
+    fi
+
+    parse_package_spec "$1"
+    resolve_latest_version
+    PKG_FULL="${PKG_NAME}@${PKG_VERSION}"
+
+    ensure_config
+    ensure_allowlist
+
+    # Check allowlist first
+    if allowlist_check "$PKG_FULL"; then
+        exit 0
+    fi
+
+    echo -e "${BLUE}🔍${NC} npx-audit: Scanning ${BOLD}${PKG_FULL}${NC}..." >&2
+
+    scan_package
+
+    if [ "$VULN_COUNT" -eq 0 ]; then
+        echo -e "${GREEN}✅${NC} npx-audit: ${BOLD}${PKG_FULL}${NC} — no known vulnerabilities" >&2
+
+        local auto_approve
+        auto_approve=$(read_config "auto_approve_clean" "true")
+        if [ "$auto_approve" = "true" ]; then
+            allowlist_add "$PKG_FULL" "auto-clean" 0 "No vulnerabilities at scan time"
+        fi
+        exit 0
+    fi
+
+    format_vuln_report
+    exit 1
+}
+
+cmd_scan() {
+    if [ $# -eq 0 ]; then
+        die "scan requires a package name. Usage: npx-audit scan <pkg[@version]>"
+    fi
+
+    parse_package_spec "$1"
+    resolve_latest_version
+    PKG_FULL="${PKG_NAME}@${PKG_VERSION}"
+
+    ensure_config
+
+    echo -e "${BLUE}🔍${NC} npx-audit: Scanning ${BOLD}${PKG_FULL}${NC}..." >&2
+
+    scan_package
+
+    if [ "$VULN_COUNT" -eq 0 ]; then
+        echo -e "${GREEN}✅${NC} npx-audit: ${BOLD}${PKG_FULL}${NC} — no known vulnerabilities" >&2
+        exit 0
+    fi
+
+    format_vuln_report
+
+    echo -e "  ${BOLD}Summary:${NC} $VULN_CRITICAL critical, $VULN_HIGH high, $VULN_MODERATE moderate, $VULN_LOW low" >&2
+}
+
+cmd_allowlist() {
+    local subcmd="${1:-list}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        list)
+            allowlist_list
+            ;;
+        remove)
+            if [ $# -eq 0 ]; then
+                die "allowlist remove requires a package. Usage: npx-audit allowlist remove <pkg@version>"
+            fi
+            allowlist_remove "$1"
+            ;;
+        *)
+            die "Unknown allowlist subcommand: $subcmd. Use: list, remove"
+            ;;
+    esac
+}
+
+show_help() {
+    cat << 'EOF'
+npx-audit — CVE vulnerability scanner for package executors
+
+Usage:
+  npx-audit exec --runner=<runner> <pkg> [args...]   Scan then execute
+  npx-audit check <pkg[@version]>                    Scan only (exit 1 if vulnerable)
+  npx-audit scan <pkg[@version]>                     Detailed vulnerability report
+  npx-audit allowlist [list|remove <pkg>]             Manage approved packages
+  npx-audit --version                                Show version
+  npx-audit --help                                   Show this help
+
+Runners: npx, pnpm-dlx, yarn-dlx, bunx
+
+Environment:
+  NPX_AUDIT_API_URL   Override deps.dev API URL (for testing)
+
+Config: ~/.config/npx-audit/config.json
+Allowlist: ~/.config/npx-audit/allowlist.json
+EOF
+}
+
+# ── Main dispatch ─────────────────────────────────────────
+
+main() {
+    require_cmd jq
+    require_cmd curl
+
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        exec)
+            shift
+            cmd_exec "$@"
+            ;;
+        check)
+            shift
+            cmd_check "$@"
+            ;;
+        scan)
+            shift
+            cmd_scan "$@"
+            ;;
+        allowlist)
+            shift
+            cmd_allowlist "$@"
+            ;;
+        --init-config)
+            ensure_config
+            ensure_allowlist
+            ;;
+        --version|-v)
+            echo "npx-audit $NPX_AUDIT_VERSION"
+            ;;
+        --help|-h|"")
+            show_help
+            ;;
+        *)
+            die "Unknown command: $cmd. Run 'npx-audit --help' for usage."
+            ;;
+    esac
+}
+
+main "$@"

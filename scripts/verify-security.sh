@@ -37,7 +37,7 @@ fail() {
 
 # ── 1. Aikido Safe Chain Installation ──────────────────────────
 
-echo -e "${BLUE}[1/4] Aikido Safe Chain${NC}"
+echo -e "${BLUE}[1/6] Aikido Safe Chain${NC}"
 
 if command -v safe-chain &> /dev/null; then
     version=$(safe-chain --version 2>&1)
@@ -69,7 +69,7 @@ echo ""
 
 # ── 2. Package Manager Interception ───────────────────────────
 
-echo -e "${BLUE}[2/4] Package Manager Interception${NC}"
+echo -e "${BLUE}[2/6] Package Manager Interception${NC}"
 echo "     (Checking if commands route through Aikido wrappers)"
 echo ""
 
@@ -109,7 +109,7 @@ echo ""
 
 # ── 3. Package Manager Configs ────────────────────────────────
 
-echo -e "${BLUE}[3/4] Package Manager Configuration${NC}"
+echo -e "${BLUE}[3/6] Package Manager Configuration${NC}"
 
 # npm
 if [ -f ~/.npmrc ]; then
@@ -173,23 +173,162 @@ fi
 
 echo ""
 
-# ── 4. Coverage Gaps ──────────────────────────────────────────
+# ── 4. npx-audit (CVE Scanner) ────────────────────────────────
 
-echo -e "${BLUE}[4/4] Known Coverage Gaps${NC}"
+echo -e "${BLUE}[4/6] npx-audit (CVE Scanner)${NC}"
+
+npx_audit_installed=false
+
+if command -v npx-audit &> /dev/null; then
+    npx_audit_version=$(npx-audit --version 2>&1)
+    pass "npx-audit installed ($npx_audit_version)"
+    npx_audit_installed=true
+else
+    fail "npx-audit not installed — run: ./scripts/setup-security.sh"
+fi
+
+if [ -f ~/.config/npx-audit/init.sh ]; then
+    pass "Shell wrappers exist (~/.config/npx-audit/init.sh)"
+else
+    fail "Shell wrappers missing (~/.config/npx-audit/init.sh)"
+fi
+
+# Check if init.sh is sourced in rc files
+npx_audit_sourced=false
+for rc_file in ~/.bashrc ~/.zshrc; do
+    if [ -f "$rc_file" ] && grep -q 'npx-audit/init.sh' "$rc_file" 2>/dev/null; then
+        pass "npx-audit sourced in $(basename $rc_file)"
+        npx_audit_sourced=true
+        break
+    fi
+done
+if [ "$npx_audit_sourced" = false ]; then
+    fail "npx-audit not sourced in any rc file"
+fi
+
+if [ -f ~/.config/npx-audit/config.json ]; then
+    pass "Config exists (~/.config/npx-audit/config.json)"
+else
+    warn "Config missing — will use defaults"
+fi
+
+if [ -f ~/.config/npx-audit/allowlist.json ]; then
+    local_count=$(jq '.packages | length' ~/.config/npx-audit/allowlist.json 2>/dev/null || echo "?")
+    pass "Allowlist exists ($local_count packages)"
+else
+    warn "Allowlist missing — will be created on first scan"
+fi
+
+# Check wrapper precedence (npx-audit should override Aikido for npx)
+if [ -f ~/.config/npx-audit/init.sh ] && [ -f ~/.safe-chain/scripts/init-posix.sh ]; then
+    # Check that npx-audit init is sourced AFTER safe-chain in rc files
+    for rc_file in ~/.bashrc ~/.zshrc; do
+        if [ -f "$rc_file" ]; then
+            sc_line=$(grep -n 'safe-chain' "$rc_file" 2>/dev/null | tail -1 | cut -d: -f1)
+            na_line=$(grep -n 'npx-audit/init.sh' "$rc_file" 2>/dev/null | tail -1 | cut -d: -f1)
+            if [ -n "$sc_line" ] && [ -n "$na_line" ]; then
+                if [ "$na_line" -gt "$sc_line" ]; then
+                    pass "Wrapper precedence correct in $(basename $rc_file) (npx-audit after Aikido)"
+                else
+                    warn "npx-audit sourced BEFORE Aikido in $(basename $rc_file) — CVE scanning may be bypassed"
+                fi
+                break
+            fi
+        fi
+    done
+fi
+
+echo ""
+
+# ── 5. SAST Tools (Static Analysis) ──────────────────────────
+
+echo -e "${BLUE}[5/6] SAST Tools (Static Analysis)${NC}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+sast_available=0
+
+# ESLint + security plugins
+if command -v eslint &> /dev/null; then
+    eslint_version=$(eslint --version 2>&1)
+    pass "ESLint installed ($eslint_version)"
+    if npm list -g eslint-plugin-security &>/dev/null 2>&1; then
+        pass "eslint-plugin-security installed"
+        sast_available=$((sast_available + 1))
+    else
+        warn "eslint-plugin-security not installed (npm install -g eslint-plugin-security)"
+    fi
+    if npm list -g eslint-plugin-no-unsanitized &>/dev/null 2>&1; then
+        pass "eslint-plugin-no-unsanitized installed"
+    else
+        warn "eslint-plugin-no-unsanitized not installed (npm install -g eslint-plugin-no-unsanitized)"
+    fi
+else
+    warn "ESLint not installed (optional: npm install -g eslint eslint-plugin-security eslint-plugin-no-unsanitized)"
+fi
+
+# Semgrep
+if command -v semgrep &> /dev/null; then
+    semgrep_version=$(semgrep --version 2>&1)
+    pass "Semgrep installed ($semgrep_version)"
+    sast_available=$((sast_available + 1))
+else
+    warn "Semgrep not installed (optional: pip3 install semgrep)"
+fi
+
+# js-x-ray
+if node -e "require('@nodesecure/js-x-ray')" 2>/dev/null; then
+    pass "js-x-ray (@nodesecure/js-x-ray) installed"
+    sast_available=$((sast_available + 1))
+else
+    warn "js-x-ray not installed (optional: npm install -g @nodesecure/js-x-ray)"
+fi
+
+# Check for scan script and config
+if [ -f "$SCRIPT_DIR/sast-scan.sh" ]; then
+    pass "sast-scan.sh script present"
+else
+    warn "sast-scan.sh not found in scripts directory"
+fi
+
+if [ -f "$SCRIPT_DIR/../configs/eslint-security.config.mjs" ]; then
+    pass "ESLint security config present (configs/eslint-security.config.mjs)"
+else
+    warn "configs/eslint-security.config.mjs not found"
+fi
+
+echo "     ($sast_available of 3 SAST tools available)"
+echo ""
+
+# ── 6. Coverage Gaps ──────────────────────────────────────────
+
+echo -e "${BLUE}[6/6] Coverage Summary${NC}"
 echo ""
 echo "  Aikido Safe Chain scans for MALWARE (backdoors, crypto miners, data exfiltration)."
-echo "  It does NOT scan for known CVE vulnerabilities. Coverage breakdown:"
+echo "  npx-audit scans for known CVE vulnerabilities in package dependency trees."
+echo "  SAST tools scan SOURCE CODE for vulnerability patterns (eval, innerHTML, etc.)."
 echo ""
-echo "    Threat              | npm install | npx <pkg>   | pnpm/yarn/bun"
-echo "    --------------------|-------------|-------------|---------------"
-echo "    Malware             | Aikido      | Aikido      | Aikido"
-echo "    Known CVEs          | npm audit   | NOT COVERED | pnpm/yarn audit"
-echo ""
-echo "  To scan installed project dependencies for CVEs:"
-echo "    ./scripts/audit-all-projects.sh ~/dev/projects"
-echo ""
-echo "  There is currently no tool that scans npx-invoked packages for CVEs."
-echo "  For high-risk npx packages, consider running them in a container."
+
+if [ "$npx_audit_installed" = true ]; then
+    echo "    Threat              | npm install | npx <pkg>   | pnpm/yarn/bun | Source Code"
+    echo "    --------------------|-------------|-------------|---------------|-------------"
+    echo "    Malware             | Aikido      | Aikido      | Aikido        | N/A"
+    echo "    Known CVEs          | npm audit   | npx-audit   | pnpm/yarn aud | N/A"
+    echo "    Code vulnerabilities| N/A         | N/A         | N/A           | sast-scan.sh"
+else
+    echo "    Threat              | npm install | npx <pkg>   | pnpm/yarn/bun | Source Code"
+    echo "    --------------------|-------------|-------------|---------------|-------------"
+    echo "    Malware             | Aikido      | Aikido      | Aikido        | N/A"
+    echo "    Known CVEs          | npm audit   | NOT COVERED | pnpm/yarn aud | N/A"
+    echo "    Code vulnerabilities| N/A         | N/A         | N/A           | sast-scan.sh"
+    echo ""
+    echo "  ⚠️  Install npx-audit to close the npx CVE gap:"
+    echo "    ./scripts/setup-security.sh"
+fi
+
+if [ "$sast_available" -eq 0 ]; then
+    echo ""
+    echo "  ⚠️  No SAST tools installed. Install via ./scripts/setup-security.sh"
+fi
 echo ""
 
 # ── Summary ───────────────────────────────────────────────────

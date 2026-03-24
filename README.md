@@ -28,25 +28,38 @@ The setup script automatically:
    - Pins exact versions (prevents supply chain attacks)
    - Adds 24h minimum release age for pnpm/yarn/bun
    - Enables provenance for npm
-4. **Optional:** Installs Socket Firewall for additional npm scanning
+4. **Installs npx-audit** — CVE vulnerability scanner for npx, pnpm dlx, yarn dlx, bunx
+5. **Optional:** Installs Socket Firewall for additional npm scanning
 
-### What Aikido Does and Does NOT Cover
+### Coverage Matrix
 
-Aikido Safe Chain scans for **malware** (backdoors, crypto miners, data exfiltration). It does **not** scan for known CVE vulnerabilities — that's what `npm audit` does.
+| Threat | `npm install` | `npx <pkg>` | `pnpm/yarn/bun` | Source Code |
+|---|---|---|---|---|
+| Malware | Socket¹ + Aikido² | Aikido² | Aikido² | N/A |
+| Known CVEs | `npm audit`³ | `npx-audit`³ | `pnpm/yarn audit`³ | N/A |
+| Code vulnerabilities | N/A | N/A | N/A | `sast-scan.sh` |
 
-| Threat | `npm install` | `npx <pkg>` | `pnpm/yarn/bun` |
-|---|---|---|---|
-| Malware | Aikido | Aikido | Aikido |
-| Known CVEs | `npm audit` | **NOT COVERED** | `pnpm/yarn audit` |
+¹ Socket Firewall (optional) — dry-run scan using Socket.dev threat intelligence before install.
+² Aikido Safe Chain — scans using Aikido threat intelligence. Performs the actual install for npm.
+³ GitHub Advisory Database (GHSA).
 
-For CVE scanning of installed project dependencies, use `audit-all-projects.sh`. There is currently no tool that scans npx-invoked packages for CVEs — for high-risk npx packages, consider running them in a container.
+When dual-scan is enabled, `npm install/ci/add` goes through both scanners (Socket dry-run first, then Aikido real install). Non-install commands route through Socket only. See `scripts/internal/npm-dual-scan.sh`.
+
+For CVE scanning of installed project dependencies, use `audit-all-projects.sh`.
+For static analysis of your source code, use `sast-scan.sh`.
 
 ## Contents
 
 - `scripts/`
-  - **`setup-security.sh`** – Automated setup: installs Aikido Safe Chain, runs `safe-chain setup` for shell integration, hardens all package manager configs
+  - **`setup-security.sh`** – Automated setup: installs Aikido Safe Chain + npx-audit + SAST tools, runs `safe-chain setup` for shell integration, hardens all package manager configs
+  - `npx-audit` – CVE vulnerability scanner for npx, pnpm dlx, yarn dlx, bunx (installed to `~/.local/bin` by setup script)
   - `audit-all-projects.sh` – Scans all projects with `npm audit`, generates timestamped logs and auto-fix scripts
-  - `verify-security.sh` – Verifies that Aikido interception is active for all package managers (npm, npx, pnpm, yarn, bun)
+  - `sast-scan.sh` – Static analysis scanner: runs ESLint security rules, Semgrep, and js-x-ray against project source code
+  - `js-x-ray-scan.mjs` – Node.js wrapper for js-x-ray (used by `sast-scan.sh`)
+  - `harden-projects.sh` – Adds project-level `.npmrc` (ignore-scripts, save-exact, package-lock) so projects are protected on any machine, even without Aikido/Socket installed
+  - `verify-security.sh` – Verifies that Aikido, npx-audit, SAST tools, and package manager configs are all active
+- `configs/`
+  - `eslint-security.config.mjs` – Standalone ESLint config with security-only rules (does not interfere with project ESLint configs)
 - `docs/`
   - `NPM-SECURITY-SETUP.md` – Complete security guide covering:
     - Multi-package manager hardening (npm, pnpm, yarn, bun)
@@ -61,24 +74,21 @@ For CVE scanning of installed project dependencies, use `audit-all-projects.sh`.
 
 This project integrates and configures:
 
-- **Aikido Safe Chain** (PRIMARY) - Multi-package manager security wrapper
+- [**Aikido Safe Chain**](https://github.com/AikidoSec/safe-chain) (PRIMARY) - Multi-package manager security wrapper
   - Protects npm, pnpm, yarn, AND bun
   - Required for comprehensive protection
   - Free and open-source
-  https://github.com/AikidoSec/safe-chain
 
-- **Socket Firewall** (OPTIONAL) - npm-specific threat intelligence enhancement
+- [**Socket Firewall**](https://socket.dev/blog/introducing-socket-firewall) (OPTIONAL) - npm-specific threat intelligence enhancement
   - Additional layer for npm only (defense-in-depth)
   - Free to use
   - Complements Aikido for npm workflows
-  https://socket.dev/blog/introducing-socket-firewall
 
 ### Best Practices Reference
 
 This project's design and recommendations are heavily inspired by:
 
-- **npm Security Best Practices (bodadotsh)**
-  https://github.com/bodadotsh/npm-security-best-practices
+- [**npm Security Best Practices (bodadotsh)**](https://github.com/bodadotsh/npm-security-best-practices)
 
 That repository goes deep into:
 
@@ -120,7 +130,9 @@ cd npm-security-tooling
 5. ✅ Configure yarn (classic + modern) with 24h minimum release age
 6. ✅ Configure bun with security settings
 7. ✅ Ask if you want Socket Firewall (optional npm enhancement)
-8. ✅ Backup all configs before changes
+8. ✅ Install npx-audit for CVE scanning of npx/dlx packages
+9. ✅ Ask if you want SAST tools (ESLint security, Semgrep, js-x-ray)
+10. ✅ Backup all configs before changes
 
 **You just answer the prompts** - the script does everything else.
 
@@ -130,6 +142,50 @@ source ~/.bashrc
 
 # Verify everything is working:
 ./scripts/verify-security.sh
+```
+
+**Expected output (all checks passing):**
+
+```
+==========================================
+Security Verification Check
+==========================================
+
+[1/6] Aikido Safe Chain
+  PASS  Aikido Safe Chain installed (x.x.x)
+  PASS  Shell integration configured
+
+[2/6] Package Manager Interception
+  PASS  npm routes through Aikido wrapper
+  PASS  npx routes through Aikido wrapper
+  ...
+
+[3/6] Package Manager Configuration
+  PASS  npm: ignore-scripts=true
+  PASS  npm: save-exact=true
+  ...
+
+[4/6] npx-audit (CVE Scanner)
+  PASS  npx-audit installed (1.0.0)
+  PASS  Shell wrappers exist
+  ...
+
+[5/6] SAST Tools (Static Analysis)
+  PASS  ESLint installed
+  PASS  eslint-plugin-security installed
+  PASS  Semgrep installed
+  PASS  js-x-ray installed
+  ...
+
+[6/6] Coverage Summary
+  ...
+
+==========================================
+Summary
+==========================================
+  PASS: 16  WARN: 0  FAIL: 0
+
+All checks passed.
 ```
 
 ### 2. Regular Security Audits
@@ -179,13 +235,33 @@ To fix all vulnerabilities, run:
 ./scripts/fix-vulnerabilities-YYYY-MM-DD_HH-MM-SS.sh --force
 ```
 
-**What if npm audit fix can't resolve a vulnerability?**
+If `npm audit fix` can't resolve a vulnerability, see [When Audit Fix Can't Resolve Vulnerabilities](docs/NPM-SECURITY-SETUP.md#when-audit-fix-cant-resolve-vulnerabilities).
 
-The audit script runs `npm audit`, which checks for known vulnerabilities in direct and **transitive dependencies** (dependencies of your dependencies). Sometimes `npm audit fix` cannot automatically update these due to parent package constraints.
+### 3. Harden Projects (Portable Protection)
 
-**Solution:** Manually override the version in `package.json`
+The setup script configures your *machine* (`~/.npmrc`), but those settings don't travel with your repos. If someone (or an agent) clones your project on an unconfigured machine, `npm install` runs with full default behavior — including install scripts.
 
-👉 **See detailed guide:** [When Audit Fix Can't Resolve Vulnerabilities](docs/NPM-SECURITY-SETUP.md#when-audit-fix-cant-resolve-vulnerabilities)
+`harden-projects.sh` fixes this by adding a project-level `.npmrc` to each project:
+
+```bash
+# Harden all projects in a directory
+./scripts/harden-projects.sh ~/dev/projects
+```
+
+This adds a `.npmrc` to each project root with:
+
+```ini
+ignore-scripts=true    # Blocks malicious postinstall/preinstall hooks
+save-exact=true        # Prevents semver range drift
+package-lock=true      # Ensures lockfile is always used
+```
+
+**Commit the `.npmrc` files** — any `npm install` on *any* machine respects these settings, even without Aikido or Socket installed.
+
+The script also checks for:
+- Missing or uncommitted lockfiles
+- `.npmrc` being gitignored (meaning it won't travel with the repo)
+- Dangerous overrides (`ignore-scripts=false`) — fixable with `--fix-overrides`
 
 ---
 
@@ -198,6 +274,52 @@ alias npm-audit='~/devtools/npm-security-tooling/scripts/audit-all-projects.sh ~
 # Then simply run:
 npm-audit
 ```
+
+### 4. Daily Usage
+
+All package managers are automatically protected:
+
+```bash
+npm install express    # ✅ Protected by Aikido (malware scan)
+npx create-next-app   # ✅ Protected by npx-audit (CVE) + Aikido (malware)
+pnpm install express   # ✅ Protected by Aikido (malware scan)
+pnpm dlx create-app   # ✅ Protected by npx-audit (CVE) + Aikido (malware)
+yarn add express       # ✅ Protected by Aikido (malware scan)
+bun add express        # ✅ Protected by Aikido (malware scan)
+```
+
+To check that protection is still active at any time:
+
+```bash
+./scripts/verify-security.sh
+```
+
+### 5. Static Analysis (SAST) Scanning
+
+Scan your source code for security vulnerabilities (eval, innerHTML, SQL injection, obfuscated code, etc.):
+
+```bash
+# Scan a single project
+./scripts/sast-scan.sh ~/dev/projects/my-app
+
+# Scan all projects in a directory
+./scripts/sast-scan.sh ~/dev/projects
+
+# Run only one tool
+./scripts/sast-scan.sh --eslint-only ~/dev/projects/my-app
+./scripts/sast-scan.sh --semgrep-only ~/dev/projects/my-app
+./scripts/sast-scan.sh --js-x-ray-only ~/dev/projects/my-app
+
+# JSON output (for CI integration)
+./scripts/sast-scan.sh --json ~/dev/projects/my-app
+```
+
+**Tools used:**
+- **ESLint + security plugins** — Detects `eval()`, `innerHTML`, SQL injection patterns, timing attacks
+- **Semgrep** — Multi-language SAST with curated security rules (no login required)
+- **js-x-ray** — Detects obfuscated code, encoded literals, unsafe imports
+
+All tools are optional — the scan runs whichever tools are installed and reports combined results.
 
 ---
 
@@ -233,23 +355,3 @@ For Windows users:
    - See `docs/NPM-SECURITY-SETUP.md` for config file contents
 
 **Note:** These scripts are tested on Linux. Platform-specific issues may require manual config adjustments.
-
----
-
-### 3. Daily Usage
-
-All package managers are now automatically protected:
-
-```bash
-npm install express    # ✅ Protected by Aikido (malware scan)
-npx create-next-app   # ✅ Protected by Aikido (malware scan)
-pnpm install express   # ✅ Protected by Aikido (malware scan)
-yarn add express       # ✅ Protected by Aikido (malware scan)
-bun add express        # ✅ Protected by Aikido (malware scan)
-```
-
-To check that protection is still active at any time:
-
-```bash
-./scripts/verify-security.sh
-```

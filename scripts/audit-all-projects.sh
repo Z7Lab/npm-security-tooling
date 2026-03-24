@@ -22,8 +22,8 @@ fi
 # Get the directory where this script is located (for log/script output)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
-LOG_FILE="$SCRIPT_DIR/npm-audit-$TIMESTAMP.log"
-FIX_SCRIPT="$SCRIPT_DIR/fix-vulnerabilities-$TIMESTAMP.sh"
+LOG_FILE="$SCRIPT_DIR/output/npm-audit-$TIMESTAMP.log"
+FIX_SCRIPT="$SCRIPT_DIR/output/fix-vulnerabilities-$TIMESTAMP.sh"
 
 echo "==================================================================" | tee -a "$LOG_FILE"
 echo "NPM Security Audit - $(date)" | tee -a "$LOG_FILE"
@@ -40,16 +40,24 @@ else
     echo "  Package manager commands (npm, npx, pnpm, yarn, bun) may not be" | tee -a "$LOG_FILE"
     echo "  intercepted for malware scanning. Run: safe-chain setup" | tee -a "$LOG_FILE"
 fi
+if command -v npx-audit &> /dev/null; then
+    echo "npx-audit: installed ($(npx-audit --version 2>&1))" | tee -a "$LOG_FILE"
+    allowlist_count=$(jq '.packages | length' ~/.config/npx-audit/allowlist.json 2>/dev/null || echo "0")
+    echo "  Allowlist: $allowlist_count packages approved" | tee -a "$LOG_FILE"
+else
+    echo "npx-audit: not installed (npx/dlx packages not scanned for CVEs)" | tee -a "$LOG_FILE"
+fi
 echo "" | tee -a "$LOG_FILE"
 echo "NOTE: This audit scans installed project dependencies for known CVEs" | tee -a "$LOG_FILE"
-echo "  using npm audit. Packages invoked via npx are NOT covered here." | tee -a "$LOG_FILE"
-echo "  Aikido covers npx for malware, but not for CVE vulnerabilities." | tee -a "$LOG_FILE"
+echo "  using npm audit. Packages invoked via npx/dlx are scanned separately" | tee -a "$LOG_FILE"
+echo "  by npx-audit (if installed) at invocation time." | tee -a "$LOG_FILE"
 echo "" | tee -a "$LOG_FILE"
 
 # Counter for stats
 total_projects=0
 vulnerable_projects=0
 clean_projects=0
+unhardened_projects=0
 
 # Initialize fix script
 echo "#!/bin/bash" > "$FIX_SCRIPT"
@@ -85,10 +93,16 @@ while IFS= read -r package_file; do
         continue
     fi
 
-    ((total_projects++))
+    total_projects=$((total_projects + 1))
 
     echo "📦 Scanning: $project_name" | tee -a "$LOG_FILE"
     echo "   Path: $dir" | tee -a "$LOG_FILE"
+
+    # Check for project-level hardening (.npmrc with ignore-scripts=true)
+    if [ ! -f "$dir/.npmrc" ] || ! grep -q "^ignore-scripts=true" "$dir/.npmrc" 2>/dev/null; then
+        echo "   ⚠️  Project NOT hardened (no project-level .npmrc with ignore-scripts=true)" | tee -a "$LOG_FILE"
+        unhardened_projects=$((unhardened_projects + 1))
+    fi
 
     if ! cd "$dir"; then
         echo "   ⚠️  Skipped: Unable to access directory" | tee -a "$LOG_FILE"
@@ -102,11 +116,11 @@ while IFS= read -r package_file; do
 
     if [ $audit_exit_code -eq 0 ]; then
         echo "   ✅ No vulnerabilities found" | tee -a "$LOG_FILE"
-        ((clean_projects++))
+        clean_projects=$((clean_projects + 1))
     else
         echo "   ⚠️  VULNERABILITIES DETECTED!" | tee -a "$LOG_FILE"
         echo "$audit_output" >> "$LOG_FILE"
-        ((vulnerable_projects++))
+        vulnerable_projects=$((vulnerable_projects + 1))
 
         # Count severity levels
         critical=$(echo "$audit_output" | grep -oP '\d+(?= critical)' | head -1)
@@ -181,7 +195,28 @@ fi
 echo "Clean projects: $clean_projects ✅" | tee -a "$LOG_FILE"
 echo "Vulnerable projects: $vulnerable_projects ⚠️" | tee -a "$LOG_FILE"
 echo "" | tee -a "$LOG_FILE"
+
+if [ $unhardened_projects -gt 0 ]; then
+    echo "⚠️  $unhardened_projects projects lack project-level .npmrc hardening" | tee -a "$LOG_FILE"
+    echo "   These projects are unprotected on machines without your security tooling." | tee -a "$LOG_FILE"
+    echo "   Fix: ./scripts/harden-projects.sh $PROJECTS_DIR" | tee -a "$LOG_FILE"
+    echo "" | tee -a "$LOG_FILE"
+fi
+
 echo "Full log saved to: $LOG_FILE" | tee -a "$LOG_FILE"
+
+# npx-audit allowlist summary
+if command -v npx-audit &> /dev/null && [ -f ~/.config/npx-audit/allowlist.json ]; then
+    echo "" | tee -a "$LOG_FILE"
+    npx_total=$(jq '.packages | length' ~/.config/npx-audit/allowlist.json 2>/dev/null || echo "0")
+    npx_expired=$(jq --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '[.packages | to_entries[] | select(.value.rescan_after < $now)] | length' \
+        ~/.config/npx-audit/allowlist.json 2>/dev/null || echo "0")
+    echo "npx-audit allowlist: $npx_total packages ($npx_expired expired, due for rescan)" | tee -a "$LOG_FILE"
+    if [ "$npx_expired" -gt 0 ]; then
+        echo "  Run 'npx-audit allowlist list' to see expired entries" | tee -a "$LOG_FILE"
+    fi
+fi
 
 if [ $vulnerable_projects -gt 0 ]; then
     # Finalize fix script with summary
